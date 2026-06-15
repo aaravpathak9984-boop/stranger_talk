@@ -1,0 +1,15 @@
+/* index.css — minimal host reset; all app styles live in App.css */
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html, body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background: #0A0A0A;
+}
+
+#root {
+  height: 100%;
+}
