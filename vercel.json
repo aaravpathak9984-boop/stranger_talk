@@ -1,6 +1,0 @@
-{
-  "buildCommand": "cd client && npm run build",
-  "outputDirectory": "client/dist",
-  "installCommand": "rm -rf node_modules client/node_modules && npm install",
-  "framework": null
-}
