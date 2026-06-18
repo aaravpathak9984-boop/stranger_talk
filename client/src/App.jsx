@@ -11,6 +11,13 @@ function formatTime(ts) {
 let _msgId = 0;
 const uid = () => ++_msgId + Math.random();
 
+// ── Haptic feedback (Android Chrome only; no-op on iOS/desktop) ───────────────
+function haptic(pattern = 10) {
+  if (typeof navigator !== 'undefined' && navigator.vibrate) {
+    navigator.vibrate(pattern);
+  }
+}
+
 const REPORT_REASONS = [
   'Spam or scam',
   'Sexual content',
@@ -103,6 +110,7 @@ export default function App() {
     });
 
     on('paired', (data) => {
+      haptic([15, 50, 15]); // celebratory double-tap on match
       setStatus('chatting');
       addSystemMsg(data?.antigravity ? 'Reconnected via Antigravity' : 'Connected to a stranger');
     });
@@ -136,6 +144,7 @@ export default function App() {
     });
 
     on('antigravityCode', ({ code }) => {
+      haptic([10, 40, 10, 40, 10]); // festive pattern for special action
       setAgCode(code);
       setShowAgModal(true);
     });
@@ -217,6 +226,7 @@ export default function App() {
   const handleSend = () => {
     const text = inputText.trim();
     if (!text || status !== 'chatting') return;
+    haptic(8); // subtle tick — fires before emit so it feels instant
     socket.emit('sendMessage', { text, timestamp: Date.now() });
     addMsg({ text, mine: true, time: formatTime(Date.now()) });
     setInputText('');
@@ -243,6 +253,7 @@ export default function App() {
   };
 
   const handleSkip = () => {
+    haptic([10, 30, 10]); // double-pulse — more noticeable for a significant action
     socket.emit('skip');
     setIsPartnerTyping(false);
   };
@@ -253,6 +264,7 @@ export default function App() {
 
   const handleReportSubmit = () => {
     if (!reportReason) return;
+    haptic(20); // firm single pulse — confirms a deliberate moderation action
     socket.emit('reportUser', { reason: reportReason });
     setShowReportMenu(false);
     setReportReason('');
@@ -296,14 +308,14 @@ export default function App() {
           <div className="theme-toggle">
             <button
               className={`theme-btn${theme === 'dark' ? ' theme-btn--active' : ''}`}
-              onClick={() => setTheme('dark')}
+              onClick={() => { haptic(5); setTheme('dark'); }}
               aria-label="Dark mode"
             >
               Night
             </button>
             <button
               className={`theme-btn${theme === 'light' ? ' theme-btn--active' : ''}`}
-              onClick={() => setTheme('light')}
+              onClick={() => { haptic(5); setTheme('light'); }}
               aria-label="Light mode"
             >
               Day

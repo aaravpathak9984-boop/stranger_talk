@@ -1,5 +1,10 @@
 /* ── Reset & Base ────────────────────────────────────────────────────────────── */
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  -webkit-tap-highlight-color: transparent;
+}
 
 html { height: 100%; }
 
@@ -8,6 +13,8 @@ body {
   background: #0A0A0A;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
 }
 
 #root {
@@ -17,8 +24,36 @@ body {
   justify-content: center;
 }
 
-button { cursor: pointer; border: none; background: none; outline: none; font-family: inherit; }
-input, textarea { outline: none; border: none; background: none; font-family: inherit; }
+button {
+  cursor: pointer;
+  border: none;
+  background: none;
+  outline: none;
+  font-family: inherit;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: manipulation;
+  transition: transform 0.1s ease;
+}
+
+button:focus-visible {
+  outline: 2px solid var(--accent, #B8915C);
+  outline-offset: 2px;
+}
+
+button:active:not(:disabled) {
+  transform: scale(0.96);
+}
+
+input, textarea {
+  outline: none;
+  border: none;
+  background: none;
+  font-family: inherit;
+  user-select: text;
+  -webkit-user-select: text;
+}
 
 /* ── CSS Custom Properties — Dark (default) ──────────────────────────────────── */
 .app {
@@ -165,7 +200,7 @@ input, textarea { outline: none; border: none; background: none; font-family: in
   background: transparent;
   border: none;
   cursor: pointer;
-  transition: color 0.15s ease, background 0.15s ease;
+  transition: color 0.15s ease, background 0.15s ease, transform 0.1s ease;
 }
 
 .theme-btn--active {
@@ -240,7 +275,7 @@ input, textarea { outline: none; border: none; background: none; font-family: in
   color: var(--text);
   background: transparent;
   cursor: pointer;
-  transition: background 0.15s ease, color 0.15s ease;
+  transition: background 0.15s ease, color 0.15s ease, transform 0.1s ease;
 }
 
 .btn-begin:hover {
@@ -259,7 +294,7 @@ input, textarea { outline: none; border: none; background: none; font-family: in
   color: var(--text-muted);
   background: transparent;
   cursor: pointer;
-  transition: color 0.15s ease, border-color 0.15s ease;
+  transition: color 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
 }
 
 .btn-have-code:hover,
@@ -307,7 +342,7 @@ input, textarea { outline: none; border: none; background: none; font-family: in
   border: none;
   cursor: pointer;
   flex-shrink: 0;
-  transition: opacity 0.15s ease;
+  transition: opacity 0.15s ease, transform 0.1s ease;
 }
 
 .btn-enter:hover { opacity: 0.78; }
@@ -380,7 +415,7 @@ input, textarea { outline: none; border: none; background: none; font-family: in
   color: var(--text-muted);
   background: transparent;
   cursor: pointer;
-  transition: color 0.15s ease, border-color 0.15s ease;
+  transition: color 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
 }
 
 .btn-action--report:hover {
@@ -452,7 +487,7 @@ input, textarea { outline: none; border: none; background: none; font-family: in
   border: 1px solid var(--border-ix);
   flex-shrink: 0;
   cursor: pointer;
-  transition: border-color 0.12s ease, background 0.12s ease;
+  transition: border-color 0.12s ease, background 0.12s ease, transform 0.1s ease;
 }
 
 .report-reason-radio:checked {
@@ -482,7 +517,7 @@ input, textarea { outline: none; border: none; background: none; font-family: in
   color: var(--danger);
   background: transparent;
   cursor: pointer;
-  transition: background 0.15s ease, color 0.15s ease;
+  transition: background 0.15s ease, color 0.15s ease, transform 0.1s ease;
 }
 
 .btn-report-submit:not(:disabled):hover {
@@ -499,7 +534,7 @@ input, textarea { outline: none; border: none; background: none; font-family: in
   letter-spacing: 0.1em;
   color: var(--text-dim);
   cursor: pointer;
-  transition: color 0.12s ease;
+  transition: color 0.12s ease, transform 0.1s ease;
 }
 
 .btn-report-cancel:hover { color: var(--text-muted); }
@@ -690,7 +725,7 @@ input, textarea { outline: none; border: none; background: none; font-family: in
   cursor: pointer;
   flex-shrink: 0;
   min-height: 36px;
-  transition: opacity 0.15s ease;
+  transition: opacity 0.15s ease, transform 0.1s ease;
 }
 
 .btn-send:hover:not(:disabled) { opacity: 0.78; }
@@ -709,7 +744,7 @@ input, textarea { outline: none; border: none; background: none; font-family: in
   cursor: pointer;
   flex-shrink: 0;
   min-height: 36px;
-  transition: color 0.15s ease, border-color 0.15s ease;
+  transition: color 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
 }
 
 .btn-skip:hover:not(:disabled) {
@@ -790,7 +825,7 @@ input, textarea { outline: none; border: none; background: none; font-family: in
   color: var(--bg);
   border: none;
   cursor: pointer;
-  transition: opacity 0.15s ease;
+  transition: opacity 0.15s ease, transform 0.1s ease;
 }
 
 .btn-copy:hover { opacity: 0.78; }
@@ -807,7 +842,7 @@ input, textarea { outline: none; border: none; background: none; font-family: in
   color: var(--text-muted);
   background: transparent;
   cursor: pointer;
-  transition: color 0.15s ease, border-color 0.15s ease;
+  transition: color 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
 }
 
 .btn-done:hover { color: var(--text); border-color: var(--text-muted); }
