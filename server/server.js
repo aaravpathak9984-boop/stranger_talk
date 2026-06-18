@@ -21,7 +21,7 @@ const MSG_MAX_LEN   = 500;
 const ts  = () => new Date().toISOString();
 const log = (msg) => console.log(`[${ts()}] ${msg}`);
 
-/** Generate a random 6-character uppercase alphanumeric code (e.g. "XK4821") */
+/** Generate a random 6-character uppercase alphanumeric code */
 function generateCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no ambiguous O/0/I/1
   let code = '';
@@ -38,8 +38,8 @@ const redis = new Redis(REDIS_URL, {
   ...(REDIS_URL.startsWith('rediss://') && { tls: {} }),
 });
 
-redis.on('connect', () => log('🔴 Redis connected'));
-redis.on('error', (err) => log(`❌ Redis error: ${err.message}`));
+redis.on('connect', () => log('Redis connected'));
+redis.on('error', (err) => log(`Redis error: ${err.message}`));
 
 // ── Express ───────────────────────────────────────────────────────────────────
 const app = express();
@@ -61,89 +61,123 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok', uptime: process.uptime(), timestamp: Date.now() });
 });
 
+// ── Lua scripts — atomic Redis operations ─────────────────────────────────────
+
+/**
+ * matchScript — atomic matchmaking
+ * KEYS[1] = waitingQueue, KEYS[2] = activePairs, ARGV[1] = socket.id
+ *
+ * Executes as a SINGLE uninterruptible Redis operation:
+ *  - Queue non-empty: LPOP the first waiter, write both pair directions into
+ *    activePairs via HSET, return the waiter's id.
+ *  - Queue empty: RPUSH this socket onto the queue, return false.
+ *
+ * Because Redis Lua scripts are atomic, no two callers can pop the same
+ * waiter or both observe an empty queue simultaneously — the race condition
+ * in the old LPOP + separate HSET sequence is fully eliminated.
+ */
+const matchScript = `
+  local waiting = redis.call('LPOP', KEYS[1])
+  if waiting then
+    redis.call('HSET', KEYS[2], ARGV[1], waiting)
+    redis.call('HSET', KEYS[2], waiting, ARGV[1])
+    return waiting
+  else
+    redis.call('RPUSH', KEYS[1], ARGV[1])
+    return false
+  end
+`;
+
+/**
+ * teardownScript — atomic pair cleanup
+ * KEYS[1] = activePairs, ARGV[1] = socket.id
+ *
+ * Atomically: fetch the partner for this socket, delete both pair directions,
+ * return the partner id (or false if none). Eliminates the HGET -> HDEL window
+ * that concurrent skip or disconnect handlers could interleave through.
+ */
+const teardownScript = `
+  local partner = redis.call('HGET', KEYS[1], ARGV[1])
+  if partner then
+    redis.call('HDEL', KEYS[1], ARGV[1], partner)
+    return partner
+  end
+  return false
+`;
+
 // ── Matchmaking helpers ───────────────────────────────────────────────────────
 
 /**
- * Pair two sockets together:
- * - Store both directions in the Redis hash "activePairs"
- * - Emit "paired" to both sockets with each other's id
+ * Atomically attempt to match this socket via matchScript.
+ *
+ * If the script returns a partnerId and that partner is still live, emit
+ * 'paired' to both and done. If the partner is stale (disconnected between
+ * their RPUSH and our LPOP), clean up the orphaned pair entries and recurse
+ * once so this socket gets another shot. On miss, the script queues the
+ * socket and we emit 'waiting'.
  */
-async function pairSockets(socketA, partnerSocketId) {
-  // Store both directions
-  await redis.hset(ACTIVE_PAIRS, socketA.id, partnerSocketId);
-  await redis.hset(ACTIVE_PAIRS, partnerSocketId, socketA.id);
+async function handleConnect(socket) {
+  log(`[match] attempt  ${socket.id}`);
 
-  log(`✅ Paired  ${socketA.id}  ↔  ${partnerSocketId}`);
+  const partnerId = await redis.eval(
+    matchScript, 2,
+    WAITING_QUEUE, ACTIVE_PAIRS,
+    socket.id
+  );
 
-  // Notify both parties
-  socketA.emit('paired', { partnerId: partnerSocketId });
-  const partnerSocket = socketA.server.sockets.sockets.get(partnerSocketId);
-  if (partnerSocket) {
-    partnerSocket.emit('paired', { partnerId: socketA.id });
+  if (!partnerId) {
+    socket.emit('waiting');
+    log(`[match] queued   ${socket.id}`);
+    return;
+  }
+
+  // Verify the matched socket is still live in this process
+  const partnerSocket = socket.server.sockets.sockets.get(partnerId);
+  if (partnerSocket && partnerSocket.connected) {
+    log(`[match] paired   ${socket.id} <-> ${partnerId}`);
+    socket.emit('paired', {});
+    partnerSocket.emit('paired', {});
+  } else {
+    // Stale: clean up the pair entries the Lua script wrote, then retry.
+    log(`[match] stale    ${partnerId} — retrying for ${socket.id}`);
+    await redis.hdel(ACTIVE_PAIRS, socket.id, partnerId).catch(() => {});
+    await handleConnect(socket); // one recursion; very unlikely to hit twice
   }
 }
 
 /**
- * On connect: attempt to pull a waiting peer from the queue.
- * If none exists, push self onto the queue and emit "waiting".
+ * Atomically fetch + delete the pair entry for a socket.
+ * Returns partnerId string or null.
  */
-async function handleConnect(socket) {
-  log(`🔌 Connected  ${socket.id}`);
-
-  const waitingId = await redis.lpop(WAITING_QUEUE);
-
-  if (waitingId) {
-    // Make sure the waiting socket is still connected
-    const waitingSocket = socket.server.sockets.sockets.get(waitingId);
-    if (waitingSocket && waitingSocket.connected) {
-      log(`📋 Popped from queue: ${waitingId}`);
-      await pairSockets(socket, waitingId);
-    } else {
-      // Stale socket in queue — discard and put self in queue instead
-      log(`⚠️  Stale socket in queue (${waitingId}), re-queuing self`);
-      await redis.rpush(WAITING_QUEUE, socket.id);
-      socket.emit('waiting');
-      log(`⏳ Waiting  ${socket.id}  — queue size +1`);
-    }
-  } else {
-    await redis.rpush(WAITING_QUEUE, socket.id);
-    socket.emit('waiting');
-    log(`⏳ Waiting  ${socket.id}  — queue size +1`);
-  }
+async function teardownPair(socketId) {
+  const result = await redis.eval(teardownScript, 1, ACTIVE_PAIRS, socketId);
+  return result || null;
 }
 
 /**
  * On disconnect:
- * 1. Remove from waitingQueue (in case they were still waiting)
- * 2. If they were paired, notify partner and clean up both hash entries
+ * 1. LREM from waitingQueue — single atomic call, no race.
+ * 2. Atomic teardown of any active pair via teardownScript.
+ * 3. Notify partner if still connected.
  */
 async function handleDisconnect(socket, reason) {
-  log(`❌ Disconnected  ${socket.id}  (${reason})`);
+  log(`[disc]  ${socket.id} (${reason})`);
 
-  // 1. Remove from waiting queue (LREM key count value)
   const removed = await redis.lrem(WAITING_QUEUE, 0, socket.id);
-  if (removed > 0) {
-    log(`🗑️  Removed from waitingQueue: ${socket.id}`);
-  }
+  if (removed > 0) log(`[disc]  removed from waitingQueue: ${socket.id}`);
 
-  // 2. Check active pairs
-  const partnerId = await redis.hget(ACTIVE_PAIRS, socket.id);
+  const partnerId = await teardownPair(socket.id);
   if (partnerId) {
-    log(`💔 Breaking pair  ${socket.id}  ↔  ${partnerId}`);
-
-    // Delete both directions
-    await redis.hdel(ACTIVE_PAIRS, socket.id, partnerId);
-
-    // Notify partner if still connected
+    log(`[disc]  breaking pair  ${socket.id} <-> ${partnerId}`);
     const partnerSocket = socket.server.sockets.sockets.get(partnerId);
     if (partnerSocket && partnerSocket.connected) {
       partnerSocket.emit('partnerLeft');
-      log(`📢 Emitted "partnerLeft" → ${partnerId}`);
+      log(`[disc]  emitted partnerLeft -> ${partnerId}`);
     }
   }
 }
 
-// ── Socket.io ───────────────────────────────────────────────────────────────
+// ── Socket.io ─────────────────────────────────────────────────────────────────
 const io = new Server(server, {
   cors: {
     origin: CLIENT_URL,
@@ -154,16 +188,15 @@ const io = new Server(server, {
   transports: ['polling', 'websocket'],
 });
 
-// ── Connection middleware: ban check + IP rate limiting ──────────────────────
+// ── Connection middleware: ban check + IP rate limiting ───────────────────────
 io.use(async (socket, next) => {
   const ip = socket.handshake.address;
   try {
-    // 1. Ban check — if banned, send event with remaining time and reject
+    // 1. Ban check
     const banExpiry = await redis.get(`ban:${ip}`);
     if (banExpiry) {
       const remaining = Math.max(0, Math.ceil((parseInt(banExpiry) - Date.now()) / 60000));
-      log(`🚫 Refused banned IP: ${ip} (~${remaining}m remaining)`);
-      // Emit event before reject so client can show the ban overlay
+      log(`[ban]   refused ${ip} (~${remaining}m remaining)`);
       socket.emit('connectionBanned', {
         message: "You're temporarily restricted. Try again later.",
         expiresInMinutes: remaining,
@@ -175,12 +208,12 @@ io.use(async (socket, next) => {
     const count = await redis.incr(rlKey);
     if (count === 1) await redis.expire(rlKey, 60);
     if (count > 5) {
-      log(`🛑 Rate-limit hit for IP: ${ip} (count=${count})`);
+      log(`[rl]    rate-limit hit for ${ip} (count=${count})`);
       return next(new Error('Too many connections'));
     }
     next();
   } catch (err) {
-    log(`❌ io.use error: ${err.message}`);
+    log(`[err]   io.use: ${err.message}`);
     next(); // fail-open so a Redis blip doesn't lock everyone out
   }
 });
@@ -194,18 +227,14 @@ io.on('connection', async (socket) => {
   io.emit('onlineCount', io.engine.clientsCount);
 
   handleConnect(socket).catch((err) =>
-    log(`❌ handleConnect error: ${err.message}`)
+    log(`[err]   handleConnect: ${err.message}`)
   );
 
   socket.on('disconnect', async (reason) => {
-    // Clean up IP mapping
     await redis.del(`socketIP:${socket.id}`).catch(() => {});
-
-    // Broadcast updated count to everyone
     io.emit('onlineCount', io.engine.clientsCount);
-
     handleDisconnect(socket, reason).catch((err) =>
-      log(`❌ handleDisconnect error: ${err.message}`)
+      log(`[err]   handleDisconnect: ${err.message}`)
     );
   });
 
@@ -223,9 +252,9 @@ io.on('connection', async (socket) => {
       const partnerSocket = socket.server.sockets.sockets.get(partnerId);
       if (partnerSocket?.connected) {
         partnerSocket.emit('receiveMessage', { text: trimmed, timestamp });
-        log(`💬 Message ${socket.id} → ${partnerId} (${trimmed.length} chars)`);
+        log(`[msg]   ${socket.id} -> ${partnerId} (${trimmed.length} chars)`);
       }
-    } catch (err) { log(`❌ sendMessage error: ${err.message}`); }
+    } catch (err) { log(`[err]   sendMessage: ${err.message}`); }
   });
 
   // ── Typing indicator relay ─────────────────────────────────────────────────
@@ -235,28 +264,31 @@ io.on('connection', async (socket) => {
       if (!partnerId) return;
       const partnerSocket = socket.server.sockets.sockets.get(partnerId);
       if (partnerSocket?.connected) partnerSocket.emit('partnerTyping');
-    } catch (err) { log(`❌ typing error: ${err.message}`); }
+    } catch (err) { log(`[err]   typing: ${err.message}`); }
   });
 
-  // ── Skip ───────────────────────────────────────────────────────────────────────
+  // ── Skip ──────────────────────────────────────────────────────────────────
   socket.on('skip', async () => {
     try {
-      const partnerId = await redis.hget(ACTIVE_PAIRS, socket.id);
+      // Atomically get + delete the pair so no concurrent disconnect can
+      // interleave between the HGET and the HDEL
+      const partnerId = await teardownPair(socket.id);
       if (!partnerId) return;
-      // Break the pair
-      await redis.hdel(ACTIVE_PAIRS, socket.id, partnerId);
-      log(`⏭️  ${socket.id} skipped — pair broken`);
-      // Notify partner + put them back in queue
+
+      log(`[skip]  ${socket.id} -> ${partnerId}`);
+
+      // Notify the skipped partner and put them back into matchmaking
+      // (they may pair instantly with someone already in the queue)
       const partnerSocket = socket.server.sockets.sockets.get(partnerId);
       if (partnerSocket?.connected) {
         partnerSocket.emit('partnerSkipped');
-        await redis.rpush(WAITING_QUEUE, partnerId);
-        partnerSocket.emit('waiting');
-        log(`⏳ ${partnerId} re-queued after skip`);
+        await handleConnect(partnerSocket);
+        log(`[skip]  ${partnerId} re-entered matchmaking`);
       }
-      // Put skipper back into matchmaking
+
+      // Put the skipper back into matchmaking as well
       await handleConnect(socket);
-    } catch (err) { log(`❌ skip error: ${err.message}`); }
+    } catch (err) { log(`[err]   skip: ${err.message}`); }
   });
 
   // ── Report user ───────────────────────────────────────────────────────────
@@ -278,7 +310,6 @@ io.on('connection', async (socket) => {
       await redis.expire(reportersKey, BAN_DURATION_SECS);
 
       if (!added) {
-        // This reporter already reported this partner — ignore silently
         socket.emit('reportReceived');
         return;
       }
@@ -289,81 +320,71 @@ io.on('connection', async (socket) => {
       await redis.expire(reasonsKey, BAN_DURATION_SECS);
 
       // Increment count
-      const countKey   = `reports:${partnerId}:count`;
+      const countKey    = `reports:${partnerId}:count`;
       const reportCount = await redis.incr(countKey);
       await redis.expire(countKey, BAN_DURATION_SECS);
 
-      log(`🚨 Report against ${partnerId} reason="${reason}" total=${reportCount}`);
+      log(`[report] against ${partnerId} reason="${reason}" total=${reportCount}`);
 
       if (reportCount >= REPORT_THRESHOLD) {
-        // Look up partner IP from our stored mapping
         const partnerIp = await redis.get(`socketIP:${partnerId}`);
-
         if (partnerIp) {
           const banExpiry = Date.now() + BAN_DURATION_SECS * 1000;
           await redis.set(`ban:${partnerIp}`, String(banExpiry), 'EX', BAN_DURATION_SECS);
           await redis.sadd(BANNED_IPS, partnerIp);
-          log(`🚫 Banned IP ${partnerIp} (socket ${partnerId}) — ${reportCount} reports, ${BAN_DURATION_MINS}m ban`);
+          log(`[ban]   ${partnerIp} (socket ${partnerId}) — ${reportCount} reports, ${BAN_DURATION_MINS}m`);
         }
 
-        // Notify and disconnect the reported socket
         const partnerSocket = socket.server.sockets.sockets.get(partnerId);
         if (partnerSocket && partnerSocket.connected) {
           partnerSocket.emit('youWereBanned', {
             message: "You've been temporarily restricted due to multiple reports.",
             expiresInMinutes: BAN_DURATION_MINS,
           });
-          // Notify the skipper (reporter) that partner left
           socket.emit('partnerLeft');
-          // Clean up their pair
           await redis.hdel(ACTIVE_PAIRS, socket.id, partnerId);
-          // Remove from waiting queue if queued
           await redis.lrem(WAITING_QUEUE, 0, partnerId);
           partnerSocket.disconnect(true);
         }
       }
 
       socket.emit('reportReceived');
-    } catch (err) { log(`❌ reportUser error: ${err.message}`); }
+    } catch (err) { log(`[err]   reportUser: ${err.message}`); }
   });
 
-  // ── Antigravity: generate a reconnect code ──────────────────────────────────
+  // ── Antigravity: generate a reconnect code ────────────────────────────────
   socket.on('generateAntigravity', async () => {
     try {
-      // Only valid if this socket is in an active pair
       const partnerId = await redis.hget(ACTIVE_PAIRS, socket.id);
       if (!partnerId) {
-        log(`⚠️  generateAntigravity ignored — ${socket.id} not in a pair`);
+        log(`[ag]    generateAntigravity ignored — ${socket.id} not in a pair`);
         return;
       }
 
-      const code   = generateCode();
-      const agKey  = `ag:${code}`;
-      const TTL    = 3600; // 1 hour
+      const code  = generateCode();
+      const agKey = `ag:${code}`;
+      const TTL   = 3600; // 1 hour
 
-      // Persist pair snapshot with TTL
       await redis.set(
         agKey,
         JSON.stringify({ socketA: socket.id, socketB: partnerId }),
         'EX', TTL
       );
-      // Reconnect counter (starts at 0, incremented by each joiner)
       await redis.set(`${agKey}:count`, '0', 'EX', TTL);
 
-      log(`🔗 Antigravity code "${code}" created for pair ${socket.id} ↔ ${partnerId}`);
+      log(`[ag]    code "${code}" created for ${socket.id} <-> ${partnerId}`);
 
-      // Notify both users in the pair
       socket.emit('antigravityCode', { code });
       const partnerSocket = socket.server.sockets.sockets.get(partnerId);
       if (partnerSocket && partnerSocket.connected) {
         partnerSocket.emit('antigravityCode', { code });
       }
     } catch (err) {
-      log(`❌ generateAntigravity error: ${err.message}`);
+      log(`[err]   generateAntigravity: ${err.message}`);
     }
   });
 
-  // ── Antigravity: join with a reconnect code ─────────────────────────────────
+  // ── Antigravity: join with a reconnect code ───────────────────────────────
   socket.on('joinAntigravity', async ({ code }) => {
     try {
       if (!code || typeof code !== 'string') {
@@ -378,56 +399,47 @@ io.on('connection', async (socket) => {
       const pairRaw = await redis.get(agKey);
       if (!pairRaw) {
         socket.emit('antigravityError', { message: 'Code expired or invalid' });
-        log(`⚠️  Antigravity join failed — code "${code}" not found`);
+        log(`[ag]    join failed — code "${code}" not found`);
         return;
       }
 
-      // Atomically increment the joiner counter
       const count = await redis.incr(countKey);
 
       if (count === 1) {
-        // ── First rejoiner: park their socket ID and wait ─────────────────────
-        const TTL = await redis.ttl(agKey); // honour remaining TTL
+        const TTL = await redis.ttl(agKey);
         await redis.set(firstKey, socket.id, 'EX', Math.max(TTL, 60));
-        log(`🔗 Antigravity first rejoiner ${socket.id} (code "${code}"), waiting for partner`);
-        // Keep them in a visible waiting state
+        log(`[ag]    first rejoiner ${socket.id} (code "${code}")`);
         socket.emit('waiting');
 
       } else if (count === 2) {
-        // ── Second rejoiner: fetch first, pair them, clean up ─────────────────
         const firstSocketId = await redis.get(firstKey);
         if (!firstSocketId) {
-          // First socket's record expired between the two joins
           socket.emit('antigravityError', { message: 'Code expired or invalid' });
           await redis.del(agKey, countKey, firstKey);
           return;
         }
 
-        // Register both directions in activePairs
         await redis.hset(ACTIVE_PAIRS, socket.id, firstSocketId);
         await redis.hset(ACTIVE_PAIRS, firstSocketId, socket.id);
 
-        log(`✅ Antigravity reconnected: ${socket.id} ↔ ${firstSocketId} (code "${code}")`);
+        log(`[ag]    reconnected ${socket.id} <-> ${firstSocketId} (code "${code}")`);
 
-        // Notify both with antigravity flag so the client shows the right message
         socket.emit('paired', { antigravity: true });
         const firstSocket = socket.server.sockets.sockets.get(firstSocketId);
         if (firstSocket && firstSocket.connected) {
           firstSocket.emit('paired', { antigravity: true });
         }
 
-        // Clean up all Antigravity keys
         await redis.del(agKey, countKey, firstKey);
-        log(`🗑️  Antigravity keys deleted for code "${code}"`);
+        log(`[ag]    keys deleted for code "${code}"`);
 
       } else {
-        // More than 2 attempts — reject and roll back the counter
         await redis.decr(countKey);
         socket.emit('antigravityError', { message: 'Code already used' });
-        log(`⚠️  Antigravity code "${code}" already fully claimed`);
+        log(`[ag]    code "${code}" already fully claimed`);
       }
     } catch (err) {
-      log(`❌ joinAntigravity error: ${err.message}`);
+      log(`[err]   joinAntigravity: ${err.message}`);
       socket.emit('antigravityError', { message: 'Something went wrong, please try again' });
     }
   });
@@ -435,5 +447,5 @@ io.on('connection', async (socket) => {
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 server.listen(PORT, () => {
-  log(`🚀 Server listening on http://localhost:${PORT}`);
+  log(`Server listening on http://localhost:${PORT}`);
 });
