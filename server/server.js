@@ -180,11 +180,17 @@ io.use(async (socket, next) => {
 });
 
 io.on('connection', (socket) => {
+  // Broadcast updated count to everyone
+  io.emit('onlineCount', io.engine.clientsCount);
+
   handleConnect(socket).catch((err) =>
     log(`❌ handleConnect error: ${err.message}`)
   );
 
   socket.on('disconnect', (reason) => {
+    // Broadcast updated count to everyone
+    io.emit('onlineCount', io.engine.clientsCount);
+
     handleDisconnect(socket, reason).catch((err) =>
       log(`❌ handleDisconnect error: ${err.message}`)
     );
