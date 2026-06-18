@@ -217,42 +217,9 @@ export default function App() {
     if (agCode) navigator.clipboard.writeText(agCode);
   };
 
-  // ── Dev toolbar simulations (work offline, no real socket needed) ───────────
-  const simWaiting = () => {
-    setStatus('waiting');
-    setMessages([]);
-    setIsPartnerTyping(false);
-  };
-
-  const simPaired = () => {
-    // Use the real helpers so system/mine flags are set correctly
-    setStatus('chatting');
-    setMessages([]);           // clear first so helpers append cleanly
-    setIsPartnerTyping(false);
-    setOnlineCount(1347);
-    // Defer so setMessages([]) has flushed before we append
-    setTimeout(() => {
-      addSystemMsg('Connected to a stranger');
-      addMsg({ text: "hey, what's up?", mine: false, time: formatTime(Date.now()) });
-      addMsg({ text: 'not much, just testing this app 😄', mine: true, time: formatTime(Date.now()) });
-      setIsPartnerTyping(true);
-    }, 0);
-  };
-
-  const simMessage = () => {
-    addMsg({ text: "hey, how's it going?", mine: false, time: formatTime(Date.now()) });
-  };
-
-  const simPartnerLeft = () => {
-    addSystemMsg('Stranger has left');
-    setStatus('idle');
-    setIsPartnerTyping(false);
-  };
-
   // ── Render ──────────────────────────────────────────────────────────────────
   return (
-    <>
-      <div className="app">
+    <div className="app">
 
         {/* ── 1. TOPBAR ──────────────────────────────────────────────────── */}
         <header className="topbar">
@@ -457,25 +424,13 @@ export default function App() {
           </div>
         )}
 
-      </div>
+        {/* ── TOAST ───────────────────────────────────────────────────── */}
+        {toast && (
+          <div className={`toast toast--${toast.type}`} role="status" aria-live="polite">
+            {toast.text}
+          </div>
+        )}
 
-      {/* ── DEV TOOLBAR (outside app, fixed to bottom) ─────────────────── */}
-      <div className="dev-toolbar" id="dev-toolbar">
-        <span className="dev-label">dev</span>
-        <button className="dev-btn" onClick={simWaiting}>Simulate: waiting</button>
-        <button className="dev-btn" onClick={simPaired}>Simulate: paired</button>
-        <button className="dev-btn" onClick={simMessage}>Simulate: message</button>
-        <button className="dev-btn dev-btn--danger" onClick={simPartnerLeft}>
-          Simulate: partner left
-        </button>
       </div>
-
-      {/* ── TOAST ──────────────────────────────────────────────────────────── */}
-      {toast && (
-        <div className={`toast toast--${toast.type}`} role="status" aria-live="polite">
-          {toast.text}
-        </div>
-      )}
-    </>
   );
 }

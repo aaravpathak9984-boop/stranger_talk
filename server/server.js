@@ -30,9 +30,12 @@ function generateCode() {
 }
 
 // ── Redis ─────────────────────────────────────────────────────────────────────
+// When REDIS_URL uses rediss:// (TLS — required by Upstash) ioredis needs the
+// tls option explicitly; otherwise it connects in plaintext and Upstash rejects it.
 const redis = new Redis(REDIS_URL, {
   lazyConnect: false,
   maxRetriesPerRequest: 3,
+  ...(REDIS_URL.startsWith('rediss://') && { tls: {} }),
 });
 
 redis.on('connect', () => log('🔴 Redis connected'));

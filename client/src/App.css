@@ -11,9 +11,7 @@ html, body, #root {
   background: #0A0A0A;
 }
 
-/* Reserve space at the bottom so the fixed dev toolbar never overlaps the chat UI */
 body {
-  padding-bottom: 34px;
   font-family: 'Space Grotesk', system-ui, sans-serif;
   color: #F0EDE8;
   -webkit-font-smoothing: antialiased;
@@ -325,6 +323,7 @@ input, textarea {
 /* ── 5. MESSAGES AREA ───────────────────────────────────────────────────────── */
 .messages-area {
   flex: 1;
+  min-height: 0;        /* critical: allows flex child with overflow to shrink */
   overflow-y: auto;
   padding: 20px;
   display: flex;
@@ -432,7 +431,7 @@ input, textarea {
 /* ── 6. BOTTOM BAR ──────────────────────────────────────────────────────────── */
 .bottom-bar {
   display: flex;
-  align-items: flex-end;
+  align-items: center;  /* vertically center textarea + buttons */
   gap: 10px;
   padding: 12px 16px;
   border-top: 0.5px solid #1C1C1C;
