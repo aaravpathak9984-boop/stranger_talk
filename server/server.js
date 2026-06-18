@@ -158,10 +158,16 @@ const io = new Server(server, {
 io.use(async (socket, next) => {
   const ip = socket.handshake.address;
   try {
-    // 1. Ban check (per-IP key with TTL is the source of truth)
-    const isBanned = await redis.exists(`bannedIP:${ip}`);
-    if (isBanned) {
-      log(`🚫 Refused banned IP: ${ip}`);
+    // 1. Ban check — if banned, send event with remaining time and reject
+    const banExpiry = await redis.get(`ban:${ip}`);
+    if (banExpiry) {
+      const remaining = Math.max(0, Math.ceil((parseInt(banExpiry) - Date.now()) / 60000));
+      log(`🚫 Refused banned IP: ${ip} (~${remaining}m remaining)`);
+      // Emit event before reject so client can show the ban overlay
+      socket.emit('connectionBanned', {
+        message: "You're temporarily restricted. Try again later.",
+        expiresInMinutes: remaining,
+      });
       return next(new Error('You have been temporarily banned'));
     }
     // 2. Rate limit: max 5 new connections per IP per 60 s
@@ -179,7 +185,11 @@ io.use(async (socket, next) => {
   }
 });
 
-io.on('connection', (socket) => {
+io.on('connection', async (socket) => {
+  // Store IP mapping for this socket (used by report/ban logic)
+  const ip = socket.handshake.address;
+  await redis.set(`socketIP:${socket.id}`, ip, 'EX', 86400);
+
   // Broadcast updated count to everyone
   io.emit('onlineCount', io.engine.clientsCount);
 
@@ -187,7 +197,10 @@ io.on('connection', (socket) => {
     log(`❌ handleConnect error: ${err.message}`)
   );
 
-  socket.on('disconnect', (reason) => {
+  socket.on('disconnect', async (reason) => {
+    // Clean up IP mapping
+    await redis.del(`socketIP:${socket.id}`).catch(() => {});
+
     // Broadcast updated count to everyone
     io.emit('onlineCount', io.engine.clientsCount);
 
@@ -250,24 +263,62 @@ io.on('connection', (socket) => {
   socket.on('reportUser', async ({ reason }) => {
     try {
       const partnerId = await redis.hget(ACTIVE_PAIRS, socket.id);
-      if (!partnerId) return;
+      if (!partnerId) {
+        socket.emit('reportReceived');
+        return;
+      }
 
-      const reportKey  = `reports:${partnerId}`;
-      const reportCount = await redis.incr(reportKey);
-      await redis.expire(reportKey, 86400); // reset TTL on each report
+      const BAN_DURATION_SECS = 900; // 15 minutes
+      const BAN_DURATION_MINS = 15;
+      const REPORT_THRESHOLD  = 3;
+
+      // De-duplicate: only count each reporter once per partner per session
+      const reportersKey = `reports:${partnerId}:reporters`;
+      const added = await redis.sadd(reportersKey, socket.id);
+      await redis.expire(reportersKey, BAN_DURATION_SECS);
+
+      if (!added) {
+        // This reporter already reported this partner — ignore silently
+        socket.emit('reportReceived');
+        return;
+      }
+
+      // Track reason
+      const reasonsKey = `reports:${partnerId}:reasons`;
+      await redis.rpush(reasonsKey, reason || 'Unspecified');
+      await redis.expire(reasonsKey, BAN_DURATION_SECS);
+
+      // Increment count
+      const countKey   = `reports:${partnerId}:count`;
+      const reportCount = await redis.incr(countKey);
+      await redis.expire(countKey, BAN_DURATION_SECS);
 
       log(`🚨 Report against ${partnerId} reason="${reason}" total=${reportCount}`);
 
-      if (reportCount >= 3) {
-        const partnerSocket = socket.server.sockets.sockets.get(partnerId);
-        if (partnerSocket) {
-          const partnerIp = partnerSocket.handshake.address;
-          // Per-IP key with TTL so the ban naturally expires
-          await redis.set(`bannedIP:${partnerIp}`, '1', 'EX', 86400);
-          // Also record in the set for auditing
+      if (reportCount >= REPORT_THRESHOLD) {
+        // Look up partner IP from our stored mapping
+        const partnerIp = await redis.get(`socketIP:${partnerId}`);
+
+        if (partnerIp) {
+          const banExpiry = Date.now() + BAN_DURATION_SECS * 1000;
+          await redis.set(`ban:${partnerIp}`, String(banExpiry), 'EX', BAN_DURATION_SECS);
           await redis.sadd(BANNED_IPS, partnerIp);
-          log(`🚫 Banned IP ${partnerIp} (socket ${partnerId}) — ${reportCount} reports`);
-          partnerSocket.emit('banned', { message: 'You have been removed due to multiple reports.' });
+          log(`🚫 Banned IP ${partnerIp} (socket ${partnerId}) — ${reportCount} reports, ${BAN_DURATION_MINS}m ban`);
+        }
+
+        // Notify and disconnect the reported socket
+        const partnerSocket = socket.server.sockets.sockets.get(partnerId);
+        if (partnerSocket && partnerSocket.connected) {
+          partnerSocket.emit('youWereBanned', {
+            message: "You've been temporarily restricted due to multiple reports.",
+            expiresInMinutes: BAN_DURATION_MINS,
+          });
+          // Notify the skipper (reporter) that partner left
+          socket.emit('partnerLeft');
+          // Clean up their pair
+          await redis.hdel(ACTIVE_PAIRS, socket.id, partnerId);
+          // Remove from waiting queue if queued
+          await redis.lrem(WAITING_QUEUE, 0, partnerId);
           partnerSocket.disconnect(true);
         }
       }

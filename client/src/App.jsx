@@ -11,6 +11,14 @@ function formatTime(ts) {
 let _msgId = 0;
 const uid = () => ++_msgId + Math.random();
 
+const REPORT_REASONS = [
+  'Spam or scam',
+  'Sexual content',
+  'Harassment or hate speech',
+  'Underage user',
+  'Other',
+];
+
 // ── Component ─────────────────────────────────────────────────────────────────
 export default function App() {
   // ── State ──────────────────────────────────────────────────────────────────
@@ -24,13 +32,17 @@ export default function App() {
   const [reconnectInput, setReconnectInput] = useState('');
   const [agError, setAgError]             = useState(null);
   const [showReportMenu, setShowReportMenu] = useState(false);
+  const [reportReason, setReportReason]   = useState('');
   const [toast, setToast]                 = useState(null); // { text, type }
+  const [banData, setBanData]             = useState(null); // { message, expiresInMinutes }
+  const [banCountdown, setBanCountdown]   = useState(0);
 
   // ── Refs ────────────────────────────────────────────────────────────────────
   const messagesEndRef  = useRef(null);
   const textareaRef     = useRef(null);
   const typingTimerRef  = useRef(null);
   const lastTypingEmit  = useRef(0);
+  const banIntervalRef  = useRef(null);
 
   // ── Message helpers ─────────────────────────────────────────────────────────
   const addMsg = useCallback(({ text, mine, time }) => {
@@ -39,6 +51,22 @@ export default function App() {
 
   const addSystemMsg = useCallback((text) => {
     setMessages(prev => [...prev, { id: uid(), text, system: true }]);
+  }, []);
+
+  // ── Ban countdown ───────────────────────────────────────────────────────────
+  const startBanCountdown = useCallback((minutes) => {
+    setBanCountdown(minutes);
+    clearInterval(banIntervalRef.current);
+    banIntervalRef.current = setInterval(() => {
+      setBanCountdown(prev => {
+        if (prev <= 1) {
+          clearInterval(banIntervalRef.current);
+          setBanData(null);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 60000);
   }, []);
 
   // ── Auto-scroll ─────────────────────────────────────────────────────────────
@@ -53,10 +81,13 @@ export default function App() {
     return () => clearTimeout(t);
   }, [toast]);
 
+  // ── Cleanup ban interval ────────────────────────────────────────────────────
+  useEffect(() => {
+    return () => clearInterval(banIntervalRef.current);
+  }, []);
+
   // ── Socket events ───────────────────────────────────────────────────────────
   useEffect(() => {
-    // Call .off before every .on so that React StrictMode’s double-invoke
-    // never stacks up duplicate listeners on the same socket singleton.
     const on = (event, handler) => {
       socket.off(event);
       socket.on(event, handler);
@@ -119,10 +150,26 @@ export default function App() {
     });
 
     on('reportReceived', () => {
-      setToast({ text: 'Report submitted', type: 'success' });
+      setToast({ text: 'Report submitted — thank you for keeping this community safe', type: 'success' });
       setShowReportMenu(false);
+      setReportReason('');
     });
 
+    // New ban events
+    on('youWereBanned', ({ message, expiresInMinutes }) => {
+      socket.disconnect();
+      setStatus('idle');
+      setBanData({ message, expiresInMinutes });
+      startBanCountdown(expiresInMinutes);
+    });
+
+    on('connectionBanned', ({ message, expiresInMinutes }) => {
+      socket.disconnect();
+      setBanData({ message, expiresInMinutes });
+      startBanCountdown(expiresInMinutes);
+    });
+
+    // Legacy banned event for backward compat
     socket.on('banned', ({ message }) => {
       addSystemMsg(message || 'You have been banned');
       setStatus('idle');
@@ -142,10 +189,12 @@ export default function App() {
       socket.off('rateLimited');
       socket.off('messageTooLong');
       socket.off('reportReceived');
+      socket.off('youWereBanned');
+      socket.off('connectionBanned');
       socket.off('banned');
       clearTimeout(typingTimerRef.current);
     };
-  }, [addMsg, addSystemMsg]);
+  }, [addMsg, addSystemMsg, startBanCountdown]);
 
   // ── User action handlers ────────────────────────────────────────────────────
 
@@ -207,10 +256,11 @@ export default function App() {
     socket.emit('generateAntigravity');
   };
 
-  const handleReport = (reason) => {
-    socket.emit('reportUser', { reason });
-    // Optimistic feedback — server confirms with 'reportReceived'
+  const handleReportSubmit = () => {
+    if (!reportReason) return;
+    socket.emit('reportUser', { reason: reportReason });
     setShowReportMenu(false);
+    setReportReason('');
   };
 
   const handleCopyCode = () => {
@@ -220,6 +270,21 @@ export default function App() {
   // ── Render ──────────────────────────────────────────────────────────────────
   return (
     <div className="app">
+
+        {/* ── BAN OVERLAY ──────────────────────────────────────────────────── */}
+        {banData && (
+          <div className="ban-overlay">
+            <div className="ban-box">
+              <div className="ban-icon">🚫</div>
+              <h2 className="ban-title">Temporarily Restricted</h2>
+              <p className="ban-message">{banData.message}</p>
+              <div className="ban-timer">
+                <span className="ban-timer-num">{banCountdown}</span>
+                <span className="ban-timer-label">minutes remaining</span>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* ── 1. TOPBAR ──────────────────────────────────────────────────── */}
         <header className="topbar">
@@ -287,27 +352,52 @@ export default function App() {
         {/* ── 4. CHAT ACTIONS ROW ────────────────────────────────────────── */}
         {status === 'chatting' && (
           <div className="chat-actions">
-            {/* Report button with dropdown */}
+            {/* Report button with popover */}
             <div className="report-wrap">
               <button
                 id="btn-report"
                 className="btn-report"
-                onClick={() => setShowReportMenu(v => !v)}
+                onClick={() => { setShowReportMenu(v => !v); setReportReason(''); }}
               >
                 Report
               </button>
               {showReportMenu && (
-                <div className="report-menu" role="menu">
-                  {['Spam', 'Inappropriate content', 'Harassment'].map((reason) => (
+                <div className="report-popover" role="dialog" aria-label="Report user">
+                  <div className="report-popover-title">Report this user</div>
+                  <div className="report-reasons">
+                    {REPORT_REASONS.map((r) => (
+                      <label key={r} className={`report-reason-label${reportReason === r ? ' report-reason-label--selected' : ''}`}>
+                        <input
+                          type="radio"
+                          name="report-reason"
+                          className="report-reason-radio"
+                          value={r}
+                          checked={reportReason === r}
+                          onChange={() => setReportReason(r)}
+                        />
+                        {r}
+                      </label>
+                    ))}
+                  </div>
+                  <p className="report-disclaimer">
+                    False reports may result in restrictions on your own account.
+                  </p>
+                  <div className="report-actions">
                     <button
-                      key={reason}
-                      className="report-menu-item"
-                      role="menuitem"
-                      onClick={() => handleReport(reason)}
+                      id="btn-submit-report"
+                      className="btn-report-submit"
+                      onClick={handleReportSubmit}
+                      disabled={!reportReason}
                     >
-                      {reason}
+                      Submit Report
                     </button>
-                  ))}
+                    <button
+                      className="btn-report-cancel"
+                      onClick={() => { setShowReportMenu(false); setReportReason(''); }}
+                    >
+                      Cancel
+                    </button>
+                  </div>
                 </div>
               )}
             </div>
@@ -434,4 +524,3 @@ export default function App() {
       </div>
   );
 }
-
